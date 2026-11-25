@@ -12,6 +12,18 @@ const MAX_RAW_CHARACTERS = 4000;
 const REQUEST_TIMEOUT_MS = 30_000;
 const CUT_NOTICE = "\n\n_This review was cut to fit GitHub's size limit._";
 
+const GEMINI_EXIT_MEANINGS = new Map([
+  [1, "runtime or API failure"],
+  [2, "invalid usage"],
+  [3, "authentication failure"],
+]);
+
+/** @param {number} status the non-zero exit status of the gemini-api call */
+const geminiFailure = (status) => {
+  const meaning = GEMINI_EXIT_MEANINGS.get(status);
+  return `The gemini-api call failed with exit status ${status}${meaning ? ` (${meaning})` : ""}; the job log has the error.`;
+};
+
 /** @param {string} sha */
 const heading = (sha) => `## Gemini review of ${sha}`;
 
@@ -136,10 +148,13 @@ async function readIfPresent(path) {
 
 /**
  * Posts Gemini's answer as one COMMENT review. Never throws and never logs the model's text.
- * @param {{ repo: string, pr: number, sha: string, responseFile: string, diffFile: string, packReport: string, token: string, fetch?: typeof fetch }} input
+ * `earlierFailure`, when set, names the step that kept Gemini from being asked, and is posted as the failure instead.
+ * `geminiExitStatus`, when set and not 0, is the exit status of the failed gemini-api call; the notice names it
+ * and leaves the error itself to the job log, where secrets are masked.
+ * @param {{ repo: string, pr: number, sha: string, responseFile: string, diffFile: string, packReport: string, token: string, earlierFailure?: string, geminiExitStatus?: number, fetch?: typeof fetch }} input
  * @returns {Promise<void>}
  */
-export async function post({ repo, pr, sha, responseFile, diffFile, packReport, token, fetch: fetchImpl = fetch }) {
+export async function post({ repo, pr, sha, responseFile, diffFile, packReport, token, earlierFailure, geminiExitStatus, fetch: fetchImpl = fetch }) {
   /** @param {{ body: string, comments: object[], commit_id?: string }} review @returns {Promise<number>} the HTTP status, 0 when the request never got one */
   async function submit(review) {
     try {
@@ -168,6 +183,8 @@ export async function post({ repo, pr, sha, responseFile, diffFile, packReport, 
     if (status < 200 || status >= 300) console.log(`::warning::Could not post the failure notice (HTTP ${status}).`);
   }
 
+  if (earlierFailure) return postFailure(earlierFailure, "");
+  if (geminiExitStatus) return postFailure(geminiFailure(geminiExitStatus), "");
   /** @type {string} */
   let raw;
   try {
@@ -211,8 +228,12 @@ export async function post({ repo, pr, sha, responseFile, diffFile, packReport, 
   return postFailure(`Posting the review failed (HTTP ${status}).`, "");
 }
 
-async function main() {
-  const env = process.env;
+/**
+ * The arguments of `post`, read from the variables `action.yml` sets. Throws `<NAME> is not set` for a missing
+ * required one; an empty or non-numeric `GEMINI_EXIT_STATUS` is left unset.
+ * @param {Record<string, string | undefined>} env
+ */
+export function readEnv(env) {
   const [repo, pr, sha, responseFile, diffFile, packReport, token] = [
     "REPO", "PR", "SHA", "RESPONSE_FILE", "DIFF_FILE", "PACK_REPORT", "GITHUB_TOKEN",
   ].map((name) => {
@@ -220,7 +241,16 @@ async function main() {
     if (!value) throw new Error(`${name} is not set`);
     return value;
   });
-  await post({ repo, pr: Number(pr), sha, responseFile, diffFile, packReport, token });
+  const geminiExitStatus = Number.parseInt(env.GEMINI_EXIT_STATUS ?? "", 10);
+  return {
+    repo, pr: Number(pr), sha, responseFile, diffFile, packReport, token,
+    earlierFailure: env.EARLIER_FAILURE,
+    geminiExitStatus: Number.isNaN(geminiExitStatus) ? undefined : geminiExitStatus,
+  };
+}
+
+async function main() {
+  await post(readEnv(process.env));
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, test } from "node:test";
 
-import { failureBody, post, reviewBody } from "../.github/actions/review/post.mjs";
+import { failureBody, post, readEnv, reviewBody } from "../.github/actions/review/post.mjs";
 
 const sha = "abc1234def";
 const diff = "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1,1 +1,2 @@\n x\n+y\n";
@@ -129,6 +129,47 @@ test("post reports an empty response file as no answer", async () => {
   const { stub, calls } = stubFetch([200]);
   await post({ ...args, ...(await files("  \n")), fetch: stub });
   assert.match(calls[0].payload.body, /Gemini gave no answer\./);
+});
+
+test("post posts the earlier step's failure instead of the response when one is given", async () => {
+  const { stub, calls } = stubFetch([200]);
+  await post({ ...args, ...(await files(answerText([inlineFinding]))), earlierFailure: "gemini-api could not be installed", fetch: stub });
+
+  assert.equal(calls.length, 1);
+  assert.match(calls[0].payload.body, /^## Gemini review of abc1234def\n\ngemini-api could not be installed$/);
+  assert.deepEqual(calls[0].payload.comments, []);
+});
+
+test("post names a failed gemini-api call's exit status and what it means, not the response file", async () => {
+  /** @type {[number, string][]} */
+  const cases = [
+    [1, "The gemini-api call failed with exit status 1 (runtime or API failure); the job log has the error."],
+    [2, "The gemini-api call failed with exit status 2 (invalid usage); the job log has the error."],
+    [3, "The gemini-api call failed with exit status 3 (authentication failure); the job log has the error."],
+    [9, "The gemini-api call failed with exit status 9; the job log has the error."],
+  ];
+  for (const [geminiExitStatus, expected] of cases) {
+    const { stub, calls } = stubFetch([200]);
+    await post({ ...args, ...(await files(answerText([inlineFinding]))), geminiExitStatus, fetch: stub });
+    assert.equal(calls.length, 1);
+    assert.match(calls[0].payload.body, /^## Gemini review of abc1234def\n\n/);
+    assert.ok(calls[0].payload.body.endsWith(`\n\n${expected}`), calls[0].payload.body);
+    assert.deepEqual(calls[0].payload.comments, []);
+  }
+});
+
+test("post reads the response when the gemini-api exit status is 0 or unset", async () => {
+  for (const geminiExitStatus of [0, undefined]) {
+    const { stub, calls } = stubFetch([200]);
+    await post({ ...args, ...(await files(answerText([inlineFinding]))), geminiExitStatus, fetch: stub });
+    assert.equal(calls[0].payload.comments.length, 1);
+  }
+});
+
+test("an earlier step's failure wins over a gemini-api exit status", async () => {
+  const { stub, calls } = stubFetch([200]);
+  await post({ ...args, ...(await files(undefined)), earlierFailure: "Packing failed.", geminiExitStatus: 1, fetch: stub });
+  assert.ok(calls[0].payload.body.endsWith("\n\nPacking failed."));
 });
 
 test("post posts a failure body when the review itself is refused with another status", async () => {
@@ -338,5 +379,33 @@ test("failureBody does not split a surrogate pair at the cut", () => {
   for (const offset of [0, 1]) {
     const body = failureBody(sha, "failed", "c".repeat(offset) + emoji.repeat(4000));
     assert.ok(body.isWellFormed());
+  }
+});
+
+const requiredEnv = {
+  REPO: "o/r", PR: "12", SHA: "abc1234", RESPONSE_FILE: "/r.txt", DIFF_FILE: "/d.txt", PACK_REPORT: "/p.json", GITHUB_TOKEN: "t",
+};
+
+test("readEnv maps the action's variables to post's arguments", () => {
+  assert.deepEqual(readEnv(requiredEnv), {
+    repo: "o/r", pr: 12, sha: "abc1234", responseFile: "/r.txt", diffFile: "/d.txt", packReport: "/p.json", token: "t",
+    earlierFailure: undefined, geminiExitStatus: undefined,
+  });
+});
+
+test("readEnv passes EARLIER_FAILURE through", () => {
+  assert.equal(readEnv({ ...requiredEnv, EARLIER_FAILURE: "x" }).earlierFailure, "x");
+});
+
+test("readEnv reads GEMINI_EXIT_STATUS as a number, and an empty or non-numeric one as unset", () => {
+  assert.equal(readEnv({ ...requiredEnv, GEMINI_EXIT_STATUS: "3" }).geminiExitStatus, 3);
+  assert.equal(readEnv({ ...requiredEnv, GEMINI_EXIT_STATUS: "" }).geminiExitStatus, undefined);
+  assert.equal(readEnv({ ...requiredEnv, GEMINI_EXIT_STATUS: "abc" }).geminiExitStatus, undefined);
+});
+
+test("readEnv names a missing required variable", () => {
+  for (const name of Object.keys(requiredEnv)) {
+    const env = Object.fromEntries(Object.entries(requiredEnv).filter(([key]) => key !== name));
+    assert.throws(() => readEnv(env), { message: `${name} is not set` });
   }
 });
