@@ -1,0 +1,25 @@
+# This repository's own Gemini review, from the reusable workflow beside it, so a pull request that
+# changes the review is reviewed by its own version.
+name: Gemini review
+
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review, reopened]
+
+permissions: {}
+
+# A person's new push cancels the review still running, so only the latest commit is reviewed. An
+# event a bot sends gets a group of its own, so it can't cancel a review: the called job skips it.
+concurrency:
+  group: gemini-review-${{ github.event.pull_request.number }}${{ github.event.sender.type != 'User' && format('-{0}', github.run_id) || '' }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    permissions:
+      contents: read
+      pull-requests: write
+      id-token: write
+    uses: ./.github/workflows/gemini-review.yml
+    secrets:
+      CI_SECRETS_AWS_ACCOUNT: ${{ secrets.CI_SECRETS_AWS_ACCOUNT }}
