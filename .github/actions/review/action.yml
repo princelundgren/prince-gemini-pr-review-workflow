@@ -1,0 +1,253 @@
+# Gemini reviews the pull request that started the job in one API call, with no tools, and posts one
+# COMMENT review whose body starts "## Gemini review of <head sha>". The calling job owns the
+# runner, the token's permissions, the timeout (over Ask Gemini's own 15 minutes) and the rest of
+# the gate.
+name: Gemini review
+description: Gemini reviews the pull request from the attached material and posts one comment review.
+inputs:
+  gemini-api-key:
+    description: The Gemini API key.
+    required: true
+  review-prompt:
+    description: >-
+      A review prompt in review-prompt.md's form (an HTML comment ending in a line that is exactly
+      -->, a blank line, then ## Role) instead of the shared one from
+      prince-claude-pr-review-workflow. A relative path is read from the pull request's checkout,
+      so the pull request can change its own prompt.
+    default: ''
+  extra-material:
+    description: >-
+      A directory outside the checkout, such as one under $RUNNER_TEMP, whose files Gemini also
+      reads.
+    default: ''
+  github-token:
+    description: >-
+      The token that reads the pull request and posts the review. Gemini's earlier reviews are
+      found by the author github-actions[bot], so the reviews another token posts aren't recognised
+      as earlier ones.
+    default: ${{ github.token }}
+runs:
+  using: composite
+  steps:
+    # Gemini reads text the pull request's author controls while it holds the Gemini key, so the
+    # review runs only for a pull request from a branch here, whatever the calling job checks.
+    - name: Refuse anything but a pull request from this repository
+      shell: bash
+      env:
+        EVENT: ${{ github.event_name }}
+        HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+      run: |
+        if [ "$EVENT" != pull_request ] || [ "$HEAD_REPO" != "$GITHUB_REPOSITORY" ]; then
+          echo "::error::The review runs only for a pull_request from a branch of $GITHUB_REPOSITORY, not $EVENT from '$HEAD_REPO'."
+          exit 1
+        fi
+
+    - name: Check out the merge commit
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+
+    - name: Refuse symlinks
+      shell: bash
+      run: |
+        # awk reads the whole list: grep -q would stop at the first match, git would die of SIGPIPE
+        # and pipefail would turn the match into a pass.
+        if git ls-files --stage | awk '$1 == "120000" { found = 1 } END { exit !found }'; then
+          echo "::error::This pull request has a symlink, so Gemini can't safely review it."
+          exit 1
+        fi
+
+    # actions/checkout places a repository only under $GITHUB_WORKSPACE, which is the pull
+    # request's checkout, so plain git fetches the pinned commit into $RUNNER_TEMP. Dependabot can't
+    # see this pin: move it with that repository's release tag when the shared prompt changes.
+    - name: Check out the shared prompt and skill
+      shell: bash
+      env:
+        CLAUDE_PROMPT_SHA: dac8dfd49fa6644456db97263b0e4010931924d4 # v2.1.0
+      run: |
+        dir="$RUNNER_TEMP/claude-prompt"
+        rm -rf "$dir"
+        git init -q "$dir"
+        git -C "$dir" fetch -q --depth 1 https://github.com/princelundgren/prince-claude-pr-review-workflow.git "$CLAUDE_PROMPT_SHA"
+        git -C "$dir" checkout -q FETCH_HEAD
+
+    # package-manager-cache: false, since the pull request's package.json would otherwise turn on a
+    # cache in a job that holds a write token.
+    - name: Set up Node
+      uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+      with:
+        node-version: 24
+        package-manager-cache: false
+
+    - name: Pack the material
+      id: pack
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        PR_TITLE: ${{ github.event.pull_request.title }}
+        PR_BODY: ${{ github.event.pull_request.body }}
+        EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        EXTRA_MATERIAL: ${{ inputs.extra-material }}
+      run: |
+        if [ -n "$EXTRA_MATERIAL" ]; then
+          [ -d "$EXTRA_MATERIAL" ] || { echo "::error::extra-material '$EXTRA_MATERIAL' is not a directory."; exit 1; }
+          extra=$(realpath "$EXTRA_MATERIAL")
+          temp=$(realpath "$RUNNER_TEMP")
+          for own in "$(realpath "$GITHUB_WORKSPACE")" "$temp/claude-prompt" "$temp/gemini" "$temp/gemini-api" "$temp/gemini-home"; do
+            case "$extra/" in "$own/"*) overlap=1 ;; esac
+            case "$own/" in "$extra/"*) overlap=1 ;; esac
+          done
+          if [ -n "${overlap:-}" ]; then
+            echo "::error::extra-material '$EXTRA_MATERIAL' overlaps the checkout or this action's own directories under \$RUNNER_TEMP."
+            exit 1
+          fi
+        fi
+        export DIR="$RUNNER_TEMP/gemini"
+        rm -rf "$DIR"
+        mkdir "$DIR"
+        gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/commits" --paginate \
+          --jq '.[] | "\(.sha[0:8]) \(.commit.message)\n"' > "$DIR/commits.txt"
+        # gh exits non-zero when GitHub refuses a diff over its size limit.
+        if ! gh pr diff "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" > "$DIR/diff.txt" || [ ! -s "$DIR/diff.txt" ]; then
+          echo "::error::GitHub gave no diff for this pull request (it may be over GitHub's diff size limit)."
+          exit 1
+        fi
+        gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/files" --paginate \
+          --jq '.[].filename | @json' > "$DIR/changed-paths.jsonl"
+        gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/reviews" --paginate \
+          --jq '.[] | select(.user.login == "github-actions[bot]" and (.body // "" | startswith("## Gemini review"))) | .body | @json' \
+          > "$DIR/earlier-reviews.jsonl"
+        # The checkout and the review's label are the event's commit, but the fetches above are
+        # live: after a push, the newer push's run reviews it, so this one stops without an error.
+        current_head=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" --jq .head.sha)
+        if [ "$current_head" != "$EVENT_HEAD_SHA" ]; then
+          echo "::notice::The pull request's head moved from $EVENT_HEAD_SHA to $current_head during this run, so the run for the newer push reviews it."
+          echo "head-moved=true" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        echo "head-moved=false" >> "$GITHUB_OUTPUT"
+        # 1,000,000 bytes is about a third of Gemini 4's 1M-token window, which input, thinking
+        # and output share, and caps what one review costs.
+        node -e '
+          const { readFileSync, writeFileSync } = require("node:fs");
+          const { join } = require("node:path");
+          const env = process.env;
+          const read = (name) => readFileSync(join(env.DIR, name), "utf8");
+          const jsonLines = (name) => read(name).split("\n").filter(Boolean).map((line) => JSON.parse(line));
+          writeFileSync(join(env.DIR, "pack-args.json"), JSON.stringify({
+            checkout: env.GITHUB_WORKSPACE,
+            outFile: join(env.DIR, "material.md"),
+            reportFile: join(env.DIR, "pack-report.json"),
+            pr: { title: env.PR_TITLE, body: env.PR_BODY, commits: read("commits.txt"), diff: read("diff.txt") },
+            changedPaths: jsonLines("changed-paths.jsonl"),
+            earlierReviews: jsonLines("earlier-reviews.jsonl"),
+            extraDir: env.EXTRA_MATERIAL || undefined,
+            skillDir: join(env.RUNNER_TEMP, "claude-prompt/.github/actions/review/github-actions-hardening"),
+            limitBytes: 1000000,
+          }));
+        '
+        node "$GITHUB_ACTION_PATH/pack.mjs" "$DIR/pack-args.json"
+
+    # The shared prompt opens with an HTML comment (the attribution), which is left out, as the
+    # Claude review leaves it out.
+    - name: Build the prompt
+      id: prompt
+      if: ${{ steps.pack.outputs.head-moved != 'true' }}
+      shell: bash
+      env:
+        REVIEW_PROMPT: ${{ inputs.review-prompt }}
+      run: |
+        prompt_file="${REVIEW_PROMPT:-$RUNNER_TEMP/claude-prompt/.github/actions/review/review-prompt.md}"
+        shared=$(awk 'seen { print } /^-->$/ && !seen { seen = 1; getline }' "$prompt_file")
+        case "$shared" in
+          "## Role"*) ;;
+          *) echo "::error::$prompt_file has no '-->' line followed by a blank line and '## Role'."; exit 1 ;;
+        esac
+        printf '%s\n\n%s\n' "$shared" "$(cat "$GITHUB_ACTION_PATH/gemini-part.md")" > "$RUNNER_TEMP/gemini/system.md"
+
+    # Dependabot can't see this pin: bump the version and gemini-api.sha256 together, from the
+    # release's checksums.txt.
+    - name: Install gemini-api
+      id: install
+      if: ${{ steps.pack.outputs.head-moved != 'true' }}
+      shell: bash
+      env:
+        GEMINI_API_VERSION: v0.5.0
+      run: |
+        case "$RUNNER_OS/$RUNNER_ARCH" in
+          Linux/X64) asset=gemini-api_Linux_x86_64.tar.gz ;;
+          Linux/ARM64) asset=gemini-api_Linux_arm64.tar.gz ;;
+          *) echo "::error::gemini-api has no release asset for $RUNNER_OS/$RUNNER_ARCH."; exit 1 ;;
+        esac
+        dir="$RUNNER_TEMP/gemini-api"
+        rm -rf "$dir"
+        mkdir "$dir"
+        curl -fsSL --retry 3 -o "$dir/$asset" "https://github.com/google-gemini/gemini-api-cli/releases/download/$GEMINI_API_VERSION/$asset"
+        (cd "$dir" && sha256sum -c --ignore-missing "$GITHUB_ACTION_PATH/gemini-api.sha256")
+        tar -xzf "$dir/$asset" -C "$dir" gemini-api
+
+    # env -i leaves the job's token, the OIDC request variables and whatever GITHUB_ENV set out of
+    # the model's process. --timeout ends a hung call in time for the next step to post that.
+    - name: Ask Gemini
+      id: ask
+      if: ${{ steps.pack.outputs.head-moved != 'true' }}
+      continue-on-error: true
+      shell: bash
+      env:
+        GEMINI_API_KEY: ${{ inputs.gemini-api-key }}
+      run: |
+        dir="$RUNNER_TEMP/gemini"
+        home="$RUNNER_TEMP/gemini-home"
+        rm -rf "$home"
+        mkdir "$home"
+        status=0
+        env -i PATH=/usr/bin:/bin HOME="$home" GEMINI_API_KEY="$GEMINI_API_KEY" "$RUNNER_TEMP/gemini-api/gemini-api" \
+          --timeout 15m generate -m gemini-4-neon --stream=false --output-format json \
+          --system "$(cat "$dir/system.md")" --body "@$GITHUB_ACTION_PATH/request-body.json" --stdin \
+          < "$dir/material.md" > "$dir/response.json" || status=$?
+        echo "status=$status" >> "$GITHUB_OUTPUT"
+        # A failed call doesn't end the step here: its exit status goes to the failure notice
+        # through the step's output. Its error is on stderr, so it stays in the job log, which masks
+        # secrets, and is not posted. At exit 0, output that isn't JSON goes on as it is, so the
+        # notice can show it; after a failed call the notice gives the exit status instead.
+        node -e '
+          const raw = require("node:fs").readFileSync(0, "utf8");
+          let interaction;
+          try {
+            interaction = JSON.parse(raw);
+          } catch {
+            process.stdout.write(raw);
+            process.exit(0);
+          }
+          const blocks = (interaction.steps ?? []).filter((step) => step.type === "model_output").flatMap((step) => step.content ?? []);
+          const text = blocks.filter((block) => block.type === "text").map((block) => block.text).join("");
+          process.stdout.write(interaction.output_text || text);
+        ' < "$dir/response.json" > "$dir/response.txt"
+        exit "$status"
+
+    # Not after a cancel: the run a newer push started reviews in its place.
+    - name: Post the review
+      if: ${{ !cancelled() && steps.pack.outcome != 'skipped' && steps.pack.outputs.head-moved != 'true' }}
+      shell: bash
+      env:
+        REPO: ${{ github.repository }}
+        PR: ${{ github.event.pull_request.number }}
+        SHA: ${{ github.event.pull_request.head.sha }}
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+        PACK_OUTCOME: ${{ steps.pack.outcome }}
+        PROMPT_OUTCOME: ${{ steps.prompt.outcome }}
+        INSTALL_OUTCOME: ${{ steps.install.outcome }}
+        GEMINI_EXIT_STATUS: ${{ steps.ask.outputs.status }}
+      run: |
+        if [ "$PACK_OUTCOME" != success ]; then
+          export EARLIER_FAILURE="The material could not be packed; the job log says why."
+        elif [ "$PROMPT_OUTCOME" != success ]; then
+          export EARLIER_FAILURE="The prompt could not be built; the job log says why."
+        elif [ "$INSTALL_OUTCOME" != success ]; then
+          export EARLIER_FAILURE="The gemini-api tool could not be installed; the job log says why."
+        fi
+        RESPONSE_FILE="$RUNNER_TEMP/gemini/response.txt" \
+          DIFF_FILE="$RUNNER_TEMP/gemini/diff.txt" \
+          PACK_REPORT="$RUNNER_TEMP/gemini/pack-report.json" \
+          node "$GITHUB_ACTION_PATH/post.mjs"

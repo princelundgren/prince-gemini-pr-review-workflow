@@ -1,7 +1,8 @@
 version: 2
 updates:
   - package-ecosystem: "github-actions"
-    directories: ["/"]
+    # / covers .github/workflows/ and a root action.yml only, not the review action's own pins.
+    directories: ["/", "/.github/actions/review"]
     schedule:
       interval: "weekly"
     groups:

@@ -24,3 +24,126 @@ jobs:
       - run: npm ci
       - run: node --test
       - run: npx tsc --noEmit -p .
+
+      # Runs the action's own "Ask Gemini" script with a stand-in for gemini-api that answers with
+      # its environment and records its arguments, so the check fails if env -i lets anything else
+      # through, a value changes, or a flag of the call is dropped or changed.
+      - name: Check that Gemini's process gets only PATH, HOME and the key, and the call's arguments
+        env:
+          GEMINI_API_KEY: dummy-key
+        run: |
+          mkdir -p "$RUNNER_TEMP/gemini-api" "$RUNNER_TEMP/gemini"
+          stand_in="$RUNNER_TEMP/gemini-api/gemini-api"
+          {
+            echo "#!$(command -v node)"
+            echo 'const { env } = process;'
+            echo "require('node:fs').writeFileSync('$RUNNER_TEMP/gemini-args.txt', process.argv.slice(2).map((arg) => arg + require('node:os').EOL).join(''));"
+            echo 'const seen = [Object.keys(env).sort().join(" "), env.PATH, env.HOME, env.GEMINI_API_KEY].join("|");'
+            echo 'process.stdout.write(JSON.stringify({ steps: [{ type: "model_output", content: [{ type: "text", text: seen }] }] }));'
+          } > "$stand_in"
+          chmod +x "$stand_in"
+          echo "the system prompt" > "$RUNNER_TEMP/gemini/system.md"
+          : > "$RUNNER_TEMP/gemini/material.md"
+          yq '.runs.steps[] | select(.name == "Ask Gemini") | .run' .github/actions/review/action.yml > "$RUNNER_TEMP/ask-gemini.sh"
+          GITHUB_ACTION_PATH="$PWD/.github/actions/review" bash -eo pipefail "$RUNNER_TEMP/ask-gemini.sh"
+          seen=$(cat "$RUNNER_TEMP/gemini/response.txt")
+          expected="GEMINI_API_KEY HOME PATH|/usr/bin:/bin|$RUNNER_TEMP/gemini-home|dummy-key"
+          [ "$seen" = "$expected" ] || { echo "::error::Gemini's process got '$seen', not '$expected'."; exit 1; }
+          args=$(cat "$RUNNER_TEMP/gemini-args.txt")
+          expected_args=$(printf '%s\n' --timeout 15m generate -m gemini-4-neon --stream=false --output-format json \
+            --system "the system prompt" --body "@$PWD/.github/actions/review/request-body.json" --stdin)
+          [ "$args" = "$expected_args" ] || { printf '::error::gemini-api got these arguments:\n%s\nnot these:\n%s\n' "$args" "$expected_args"; exit 1; }
+
+      # The symlink sorts first and thousands of files follow it, so a check that stops reading at
+      # the first match leaves git writing into a closed pipe.
+      - name: Check that a symlink fails the review in a large checkout
+        run: |
+          yq '.runs.steps[] | select(.name == "Refuse symlinks") | .run' .github/actions/review/action.yml > "$RUNNER_TEMP/refuse-symlinks.sh"
+          repo="$RUNNER_TEMP/symlink-checkout"
+          git init -q "$repo"
+          cd "$repo"
+          for i in $(seq 3000); do echo "$i" > "file-$i"; done
+          ln -s file-1 a-link
+          git add -A
+          if bash -eo pipefail "$RUNNER_TEMP/refuse-symlinks.sh"; then
+            echo "::error::A checkout with a symlink passed."
+            exit 1
+          fi
+          git rm -q --cached a-link
+          bash -eo pipefail "$RUNNER_TEMP/refuse-symlinks.sh"
+
+      # Runs the action's own "Pack the material" script against a stand-in for gh.
+      - name: Check the pack step's stop conditions
+        run: |
+          yq '.runs.steps[] | select(.id == "pack") | .run' .github/actions/review/action.yml > "$RUNNER_TEMP/pack.sh"
+          mkdir -p "$RUNNER_TEMP/stub-bin" "$RUNNER_TEMP/stub-checkout" "$RUNNER_TEMP/claude-prompt/.github/actions/review/github-actions-hardening"
+          cat > "$RUNNER_TEMP/stub-bin/gh" <<'STUB'
+          #!/bin/bash
+          case "$*" in
+            "pr diff"*) [ -z "$STUB_NO_DIFF" ] || exit 1; echo "diff --git a/x b/x" ;;
+            *"/commits"*) echo "abc12345 message" ;;
+            *"/files"*) echo '"x"' ;;
+            *"/reviews"*) ;;
+            *"pulls/7 --jq .head.sha") echo "$STUB_HEAD" ;;
+          esac
+          STUB
+          chmod +x "$RUNNER_TEMP/stub-bin/gh"
+          export GITHUB_OUTPUT="$RUNNER_TEMP/pack-output"
+
+          # run_pack <the pull request's current head> [no-diff]: its output goes to pack-log, and its
+          # exit status is the script's.
+          run_pack() {
+            : > "$GITHUB_OUTPUT"
+            PATH="$RUNNER_TEMP/stub-bin:$PATH" GH_TOKEN=x PR_NUMBER=7 PR_TITLE=t PR_BODY=b EVENT_HEAD_SHA=aaa \
+              GITHUB_REPOSITORY=o/r GITHUB_WORKSPACE="$RUNNER_TEMP/stub-checkout" GITHUB_ACTION_PATH="$PWD/.github/actions/review" \
+              STUB_HEAD="$1" STUB_NO_DIFF="${2:-}" bash -eo pipefail "$RUNNER_TEMP/pack.sh" > "$RUNNER_TEMP/pack-log" 2>&1
+          }
+
+          if run_pack aaa no-diff; then
+            echo "::error::A pull request with no diff passed."
+            exit 1
+          fi
+          grep -q '::error::GitHub gave no diff' "$RUNNER_TEMP/pack-log" || { echo "::error::No diff gave: $(cat "$RUNNER_TEMP/pack-log")"; exit 1; }
+
+          if ! run_pack bbb; then
+            echo "::error::A moved head ended the step with an error: $(cat "$RUNNER_TEMP/pack-log")"
+            exit 1
+          fi
+          grep -q '::notice::' "$RUNNER_TEMP/pack-log" || { echo "::error::A moved head gave no notice."; exit 1; }
+          [ "$(cat "$GITHUB_OUTPUT")" = head-moved=true ] || { echo "::error::A moved head wrote '$(cat "$GITHUB_OUTPUT")'."; exit 1; }
+
+          if ! run_pack aaa; then
+            echo "::error::An unmoved head ended the step with an error: $(cat "$RUNNER_TEMP/pack-log")"
+            exit 1
+          fi
+          [ "$(cat "$GITHUB_OUTPUT")" = head-moved=false ] || { echo "::error::An unmoved head wrote '$(cat "$GITHUB_OUTPUT")'."; exit 1; }
+
+      # Runs the action's own "Post the review" script with a stand-in post.mjs that prints what the
+      # script hands it, so the check fails if the outcome-to-sentence mapping or its order changes.
+      - name: Check which earlier failure the post step reports
+        run: |
+          yq '.runs.steps[] | select(.name == "Post the review") | .run' .github/actions/review/action.yml > "$RUNNER_TEMP/post.sh"
+          mkdir -p "$RUNNER_TEMP/post-action"
+          cat > "$RUNNER_TEMP/post-action/post.mjs" <<'STUB'
+          const { EARLIER_FAILURE = "", GEMINI_EXIT_STATUS = "" } = process.env;
+          console.log(`EARLIER_FAILURE=${EARLIER_FAILURE}|GEMINI_EXIT_STATUS=${GEMINI_EXIT_STATUS}`);
+          STUB
+
+          # check_post <pack> <prompt> <install> <exit status> <expected output>
+          check_post() {
+            seen=$(PACK_OUTCOME="$1" PROMPT_OUTCOME="$2" INSTALL_OUTCOME="$3" GEMINI_EXIT_STATUS="$4" \
+              GITHUB_ACTION_PATH="$RUNNER_TEMP/post-action" bash -eo pipefail "$RUNNER_TEMP/post.sh")
+            [ "$seen" = "$5" ] || { printf '::error::Outcomes %s %s %s gave:\n%s\nnot:\n%s\n' "$1" "$2" "$3" "$seen" "$5"; exit 1; }
+          }
+
+          # The script can't evaluate expressions, so the step's env is read for what feeds each variable.
+          open='$''{{'
+          for wire in 'PACK_OUTCOME=steps.pack.outcome' 'PROMPT_OUTCOME=steps.prompt.outcome' \
+            'INSTALL_OUTCOME=steps.install.outcome' 'GEMINI_EXIT_STATUS=steps.ask.outputs.status'; do
+            fed=$(yq ".runs.steps[] | select(.name == \"Post the review\") | .env.${wire%%=*}" .github/actions/review/action.yml)
+            [ "$fed" = "$open ${wire#*=} }}" ] || { echo "::error::${wire%%=*} is fed by '$fed', not '${wire#*=}'."; exit 1; }
+          done
+          check_post failure skipped skipped "" "EARLIER_FAILURE=The material could not be packed; the job log says why.|GEMINI_EXIT_STATUS="
+          check_post success failure skipped "" "EARLIER_FAILURE=The prompt could not be built; the job log says why.|GEMINI_EXIT_STATUS="
+          check_post success success failure "" "EARLIER_FAILURE=The gemini-api tool could not be installed; the job log says why.|GEMINI_EXIT_STATUS="
+          check_post success success success 3 "EARLIER_FAILURE=|GEMINI_EXIT_STATUS=3"

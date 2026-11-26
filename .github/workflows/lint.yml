@@ -34,3 +34,15 @@ jobs:
         run: |
           command -v shellcheck >/dev/null || { echo "::error::shellcheck is missing, so actionlint would skip run: blocks."; exit 1; }
           ./actionlint -color
+
+      # actionlint doesn't check a composite action's steps, so the review action's run: blocks are
+      # shellchecked here.
+      - name: Shellcheck the review action
+        run: |
+          action=.github/actions/review/action.yml
+          steps=$(yq '.runs.steps | length' "$action")
+          for i in $(seq 0 $((steps - 1))); do
+            script=$(yq ".runs.steps[$i].run // \"\"" "$action")
+            [ -n "$script" ] || continue
+            printf '%s\n' "$script" | shellcheck --shell=bash -
+          done

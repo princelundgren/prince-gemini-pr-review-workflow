@@ -1,0 +1,37 @@
+{
+  "store": false,
+  "response_format": {
+    "type": "text",
+    "mime_type": "application/json",
+    "schema": {
+      "type": "object",
+      "properties": {
+        "summary": {
+          "type": "object",
+          "properties": {
+            "critical": { "type": "string" },
+            "suggestions": { "type": "string" },
+            "nits": { "type": "string" },
+            "checked": { "type": "string" }
+          },
+          "required": ["critical", "suggestions", "nits", "checked"]
+        },
+        "findings": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "severity": { "type": "string", "enum": ["🔴", "🟡", "🔵"] },
+              "path": { "type": "string" },
+              "line": { "type": "integer", "minimum": 1 },
+              "side": { "type": "string", "enum": ["RIGHT", "LEFT"] },
+              "body": { "type": "string" }
+            },
+            "required": ["severity", "path", "line", "side", "body"]
+          }
+        }
+      },
+      "required": ["summary", "findings"]
+    }
+  }
+}
