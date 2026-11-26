@@ -1,0 +1,10 @@
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: prince-gemini-pr-review-workflow
+  description: GitHub Actions workflow in which Gemini reviews a pull request
+spec:
+  type: library
+  lifecycle: experimental
+  owner: prince
+  system: ci
