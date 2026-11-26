@@ -1,0 +1,52 @@
+# Gemini reviews a person's pull request and posts a comment review whose first line is
+# "## Gemini review of <head sha>"; the agent or person merging reads it first. Callers run it on
+# pull_request, grant id-token: write and pass CI_SECRETS_AWS_ACCOUNT (README.md, "How to call").
+# The job reads the Gemini API key from the maintainer's AWS Parameter Store over GitHub OIDC, then
+# runs the review, the action in .github/actions/review/, on a GitHub-hosted runner.
+name: Gemini review
+
+on:
+  workflow_call:
+    secrets:
+      CI_SECRETS_AWS_ACCOUNT:
+        required: true
+
+permissions: {}
+
+jobs:
+  gemini-review:
+    # A pull request from another repository gets no secrets, so its run could only fail. The author
+    # and the sender must be people, so Gemini never reads the text of a pull request a bot opened,
+    # such as Dependabot's release notes. The gate covers only those two: commits inside a person's
+    # pull request can come from anyone. A caller picks the trigger, so the event is checked here too.
+    if: >-
+      github.event_name == 'pull_request'
+      && github.event.pull_request.draft == false
+      && github.event.pull_request.head.repo.full_name == github.repository
+      && github.event.sender.type == 'User'
+      && github.event.pull_request.user.type == 'User'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    # Gemini's review is posted with this job's token, which can read the code and write to pull
+    # requests and nothing more. id-token lets the first step assume the reader role.
+    permissions:
+      contents: read
+      pull-requests: write
+      id-token: write
+    steps:
+      # The role trusts named workflow refs, this file at refs/tags/v1 among them. The account comes
+      # from a secret, so the log shows the role's ARN as ***.
+      - name: Read the Gemini API key
+        uses: princelundgren/prince-ssm-secrets-action@60358d8e4c956f98a90d981e983014b75513ce56 # v1.0.0
+        with:
+          role-arn: arn:aws:iam::${{ secrets.CI_SECRETS_AWS_ACCOUNT }}:role/pl-prod-ci-secrets-gemini-reader
+          path: /ci/gemini
+          names: GEMINI_API_KEY
+          aws-region: eu-west-1
+
+      # Pinned by commit SHA, since a called workflow's checkout is the caller's repository, so a ./
+      # path would point into it. A change to the action lands first and a second commit moves the
+      # pin to it.
+      - uses: princelundgren/prince-gemini-pr-review-workflow/.github/actions/review@464e62fc30dc93d24125da5e7e027c48a6971247
+        with:
+          gemini-api-key: ${{ env.GEMINI_API_KEY }}
